@@ -11,11 +11,12 @@ use crate::provider::worker::ProviderHandle;
 
 use super::backend::CreateAccepted;
 use super::fake::{Calls, FakeBackend, Op, no_answer, not_sent, rejected};
+use super::handle::ProviderJobHandle;
 use super::options::{AttributeValue, ProviderJobOptions, Sides};
 use super::service::JobService;
 use super::types::{
-    CancelOutcome, CancelProgress, JobOperation, JobRejection, ProviderJobHandle, ProviderJobId,
-    ProviderJobStage, ProviderJobStatus, SubmitPhase,
+    CancelOutcome, CancelProgress, JobOperation, JobRejection, ProviderJobId, ProviderJobStage,
+    ProviderJobStatus, SubmitPhase,
 };
 
 const PRINTER: &str = "Canon_TS5400_series";
@@ -52,7 +53,7 @@ impl Rig {
         let (mut backend, calls) = FakeBackend::succeeding();
         configure(&mut backend);
         let worker = ProviderHandle::new().expect("thread starts");
-        let service = JobService::new(worker.clone(), backend);
+        let service = JobService::new(worker.clone(), backend).expect("service");
         Self {
             worker,
             service,
@@ -219,7 +220,7 @@ fn invalid_sequences_are_refused_without_touching_cups() {
     ));
 
     // A handle this provider never issued.
-    let stranger = ProviderJobHandle::from_raw(9_999);
+    let stranger = Rig::new(|_| {}).created();
     assert!(matches!(
         rig.service.submit_pdf_bytes(stranger, &pdf(), GENEROUS),
         Err(ProviderError::UnknownJobHandle { .. })
@@ -729,11 +730,8 @@ fn a_create_that_sent_nothing_leaves_no_handle_behind() {
             .create_job(PRINTER, "postcard", &options(), GENEROUS),
         Err(ProviderError::PrinterNotFound { .. })
     ));
-    // The next handle issued is 2, and 1 is gone.
-    assert!(matches!(
-        rig.service.stage(ProviderJobHandle::from_raw(1)),
-        Err(ProviderError::UnknownJobHandle { .. })
-    ));
+    // The handle was never returned, so it is not kept either.
+    assert_eq!(rig.service.tracked_handles(), 0);
 }
 
 // --- Status and cancel ------------------------------------------------------
@@ -848,4 +846,177 @@ fn job_operations_share_the_single_provider_thread() {
         })
     };
     assert!(creator.is_ok());
+}
+
+// --- Handles belong to the provider that issued them -------------------------
+//
+// Every provider numbers its handles from the same starting point. These tests
+// build two providers whose handles would collide if the handle carried only
+// that number, and check that neither can reach the other's job.
+
+/// Two providers, each with one created job at the same local sequence.
+fn two_providers_with_created_jobs() -> (Rig, ProviderJobHandle, Rig, ProviderJobHandle) {
+    let a = Rig::new(|_| {});
+    let b = Rig::new(|_| {});
+    let a_handle = a.created();
+    let b_handle = b.created();
+    (a, a_handle, b, b_handle)
+}
+
+#[test]
+fn handles_from_different_providers_never_compare_equal() {
+    let (_a, a_handle, _b, b_handle) = two_providers_with_created_jobs();
+    assert_ne!(
+        a_handle, b_handle,
+        "first handles of two providers must not be the same handle"
+    );
+}
+
+#[test]
+fn a_foreign_handle_cannot_submit_to_this_providers_job() {
+    let (a, a_handle, b, b_handle) = two_providers_with_created_jobs();
+
+    let result = b.service.submit_pdf_bytes(a_handle, &pdf(), GENEROUS);
+
+    assert!(
+        matches!(result, Err(ProviderError::UnknownJobHandle { .. })),
+        "B must refuse A's handle, got {result:?}"
+    );
+    assert_eq!(b.calls().count(Op::Start), 0, "nothing sent through B");
+    assert_eq!(b.calls().count(Op::Write), 0);
+    assert_eq!(
+        b.service.stage(b_handle).expect("B's own job"),
+        ProviderJobStage::Created { job: job42() },
+        "B's job is untouched"
+    );
+    assert_eq!(
+        a.service.stage(a_handle).expect("A's own job"),
+        ProviderJobStage::Created { job: job42() },
+        "A's job is untouched"
+    );
+    assert_eq!(a.calls().count(Op::Start), 0);
+}
+
+#[test]
+fn a_foreign_handle_cannot_close_this_providers_job() {
+    let a = Rig::new(|_| {});
+    let b = Rig::new(|_| {});
+    let a_handle = a.submitted();
+    let b_handle = b.submitted();
+
+    let result = b.service.close_job(a_handle, GENEROUS);
+
+    assert!(
+        matches!(result, Err(ProviderError::UnknownJobHandle { .. })),
+        "B must refuse A's handle, got {result:?}"
+    );
+    assert_eq!(b.calls().count(Op::Close), 0, "nothing sent through B");
+    assert_eq!(
+        b.service.stage(b_handle).expect("B's own job"),
+        ProviderJobStage::Submitted { job: job42() }
+    );
+    assert_eq!(a.calls().count(Op::Close), 0);
+}
+
+#[test]
+fn a_foreign_handle_cannot_release_this_providers_job() {
+    let (_a, a_handle, b, b_handle) = two_providers_with_created_jobs();
+
+    let result = b.service.release(a_handle);
+
+    assert!(
+        matches!(result, Err(ProviderError::UnknownJobHandle { .. })),
+        "B must refuse A's handle, got {result:?}"
+    );
+    assert_eq!(
+        b.service.stage(b_handle),
+        Ok(ProviderJobStage::Created { job: job42() }),
+        "B's own job must still be tracked"
+    );
+}
+
+#[test]
+fn a_foreign_handle_cannot_read_this_providers_job() {
+    let (_a, a_handle, b, _b_handle) = two_providers_with_created_jobs();
+    assert!(matches!(
+        b.service.stage(a_handle),
+        Err(ProviderError::UnknownJobHandle { .. })
+    ));
+}
+
+#[test]
+fn providers_created_concurrently_issue_distinct_handles() {
+    // No assumption about which provider is created or allocates first.
+    const PROVIDERS: usize = 8;
+    const HANDLES_EACH: usize = 4;
+    let barrier = Arc::new(std::sync::Barrier::new(PROVIDERS));
+    let workers: Vec<_> = (0..PROVIDERS)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let rig = Rig::new(|_| {});
+                let handles: Vec<_> = (0..HANDLES_EACH).map(|_| rig.created()).collect();
+                (rig, handles)
+            })
+        })
+        .collect();
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("worker joins"))
+        .collect();
+
+    let mut all: Vec<ProviderJobHandle> = results
+        .iter()
+        .flat_map(|(_, handles)| handles.iter().copied())
+        .collect();
+    let total = all.len();
+    all.sort();
+    all.dedup();
+    assert_eq!(all.len(), total, "every issued handle is distinct");
+
+    // And each provider still refuses every other provider's handles.
+    for (index, (rig, _)) in results.iter().enumerate() {
+        for (other, (_, handles)) in results.iter().enumerate() {
+            if index == other {
+                continue;
+            }
+            for handle in handles {
+                assert!(matches!(
+                    rig.service.stage(*handle),
+                    Err(ProviderError::UnknownJobHandle { .. })
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_job_id_outlives_the_provider_that_created_it() {
+    // Handles are bound to their provider; job ids are scheduler identity and
+    // must stay usable by a new provider, e.g. after an app restart.
+    let job = {
+        let original = Rig::new(|_| {});
+        let handle = original.submitted();
+        original.service.close_job(handle, GENEROUS).expect("close")
+    };
+    let rebuilt = ProviderJobId::new(job.printer(), job.scheduler_job_id()).expect("persisted id");
+
+    let successor = Rig::new(|backend| backend.status = Ok(ProviderJobStatus::Pending));
+    assert_eq!(
+        successor.service.job_status(&rebuilt, GENEROUS),
+        Ok(ProviderJobStatus::Pending)
+    );
+    assert_eq!(
+        successor.service.cancel_job(&rebuilt, GENEROUS),
+        Ok(CancelOutcome::CancelRequested)
+    );
+    assert_eq!(
+        successor
+            .service
+            .cancel_progress(&rebuilt)
+            .expect("readable"),
+        Some(CancelProgress::Finished(Ok(CancelOutcome::CancelRequested)))
+    );
+    assert_eq!(successor.calls().count(Op::Cancel), 1);
 }
