@@ -6,7 +6,7 @@
 //! floating-point equality.
 
 use super::value::IppValue;
-use crate::bindings;
+use crate::constants;
 
 /// One hundredth of a millimetre, the unit CUPS stores media sizes in.
 const UM_PER_CUPS_UNIT: i64 = 10;
@@ -26,8 +26,14 @@ pub const fn cups_units_to_um(value: i32) -> u32 {
 /// Which media list CUPS should consult.
 ///
 /// The numeric flags stay inside this module. The spike picked `2` for
-/// borderless once, which is `CUPS_MEDIA_FLAGS_DUPLEX`, and measured the
-/// wrong thing as a result; callers should never handle these numbers.
+/// borderless once, which is the duplex flag, and measured the wrong thing as
+/// a result; callers should never handle these numbers.
+///
+/// The values come from the crate's version-independent constants. CUPS 2
+/// declares them as `#define`s and CUPS 3 as an enum, so the generated
+/// bindings do not share a name — but both headers give the same values
+/// (`cups/cups.h` in each release), which is what makes one typed query
+/// usable against either version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaQuery {
     /// CUPS' default matching.
@@ -41,13 +47,13 @@ pub enum MediaQuery {
 }
 
 impl MediaQuery {
-    /// The `CUPS_MEDIA_FLAGS_*` value for this query.
+    /// The media-flag value this query maps to.
     pub(crate) fn flags(self) -> u32 {
         match self {
-            Self::Default => bindings::CUPS_MEDIA_FLAGS_DEFAULT,
-            Self::Borderless => bindings::CUPS_MEDIA_FLAGS_BORDERLESS,
-            Self::Exact => bindings::CUPS_MEDIA_FLAGS_EXACT,
-            Self::Ready => bindings::CUPS_MEDIA_FLAGS_READY,
+            Self::Default => constants::MEDIA_FLAGS_DEFAULT,
+            Self::Borderless => constants::MEDIA_FLAGS_BORDERLESS,
+            Self::Exact => constants::MEDIA_FLAGS_EXACT,
+            Self::Ready => constants::MEDIA_FLAGS_READY,
         }
     }
 }
@@ -168,13 +174,33 @@ mod tests {
 
     #[test]
     fn media_flags_match_cups_header() {
-        // The spike once passed 2 for borderless, which is DUPLEX, and
-        // measured the wrong variant. Pin the mapping.
-        assert_eq!(MediaQuery::Borderless.flags(), 0x01);
-        assert_ne!(MediaQuery::Borderless.flags(), 0x02);
+        // Verified against cups/cups.h in both CUPS 2 (macOS SDK 2.3.4) and
+        // CUPS 3 (libcups v3.0.3): the values agree even though CUPS 2
+        // declares them as #defines and CUPS 3 as an enum.
         assert_eq!(MediaQuery::Default.flags(), 0x00);
+        assert_eq!(MediaQuery::Borderless.flags(), 0x01);
         assert_eq!(MediaQuery::Exact.flags(), 0x04);
         assert_eq!(MediaQuery::Ready.flags(), 0x08);
+        // The spike once passed 2 for borderless, which is the duplex flag,
+        // and measured the wrong variant.
+        assert_ne!(MediaQuery::Borderless.flags(), 0x02);
+    }
+
+    #[test]
+    fn media_flags_are_distinct_bits() {
+        // A typo that collapsed two queries onto one flag would silently
+        // return the wrong media list.
+        let flags = [
+            MediaQuery::Default.flags(),
+            MediaQuery::Borderless.flags(),
+            MediaQuery::Exact.flags(),
+            MediaQuery::Ready.flags(),
+        ];
+        for (i, a) in flags.iter().enumerate() {
+            for b in flags.iter().skip(i + 1) {
+                assert_ne!(a, b, "media query flags must not collide");
+            }
+        }
     }
 
     fn postcard(width_um: u32, length_um: u32, margins: Margins) -> MediaDescriptor {

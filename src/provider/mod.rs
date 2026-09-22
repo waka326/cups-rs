@@ -12,6 +12,7 @@
 
 pub mod api;
 pub mod attribute;
+mod compat_check;
 pub mod error;
 pub mod media;
 pub mod value;

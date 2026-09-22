@@ -17,6 +17,7 @@ use std::ffi::CStr;
 use std::ptr;
 
 use crate::bindings;
+use crate::compat::{count_to_usize, cups_bool, usize_to_count};
 
 /// How a resolution's numbers should be read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,8 +135,8 @@ impl IppValue {
 }
 
 /// Read the string at `index`, if libcups returns one.
-unsafe fn string_at(attr: *mut bindings::ipp_attribute_t, index: i32) -> Option<String> {
-    let ptr = unsafe { bindings::ippGetString(attr, index, ptr::null_mut()) };
+unsafe fn string_at(attr: *mut bindings::ipp_attribute_t, index: usize) -> Option<String> {
+    let ptr = unsafe { bindings::ippGetString(attr, usize_to_count(index), ptr::null_mut()) };
     if ptr.is_null() {
         return None;
     }
@@ -157,7 +158,11 @@ unsafe fn string_at(attr: *mut bindings::ipp_attribute_t, index: i32) -> Option<
 ///
 /// `attr` must be a valid, non-null `ipp_attribute_t` owned by a live IPP
 /// message, and `index` must be less than `ippGetCount(attr)`.
-pub unsafe fn decode_value(attr: *mut bindings::ipp_attribute_t, index: i32) -> Option<IppValue> {
+pub unsafe fn decode_value(attr: *mut bindings::ipp_attribute_t, index: usize) -> Option<IppValue> {
+    // CUPS 2 indexes with c_int and CUPS 3 with usize; the conversion lives in
+    // the crate's compat layer so the rest of this function stays
+    // version-agnostic.
+    let element = usize_to_count(index);
     let tag = unsafe { bindings::ippGetValueTag(attr) };
 
     // Out-of-band tags carry no data; they are the answer themselves.
@@ -173,31 +178,32 @@ pub unsafe fn decode_value(attr: *mut bindings::ipp_attribute_t, index: i32) -> 
 
     if tag == bindings::ipp_tag_e_IPP_TAG_INTEGER {
         return Some(IppValue::Integer(unsafe {
-            bindings::ippGetInteger(attr, index)
+            bindings::ippGetInteger(attr, element)
         }));
     }
     if tag == bindings::ipp_tag_e_IPP_TAG_ENUM {
         return Some(IppValue::Enum(unsafe {
-            bindings::ippGetInteger(attr, index)
+            bindings::ippGetInteger(attr, element)
         }));
     }
     if tag == bindings::ipp_tag_e_IPP_TAG_BOOLEAN {
-        // libcups returns a C int; anything non-zero is true.
-        return Some(IppValue::Boolean(
-            unsafe { bindings::ippGetBoolean(attr, index) } != 0,
-        ));
+        // CUPS 2 returns a C int and CUPS 3 a bool; cups_bool normalises both.
+        return Some(IppValue::Boolean(cups_bool(unsafe {
+            bindings::ippGetBoolean(attr, element)
+        })));
     }
 
     if tag == bindings::ipp_tag_e_IPP_TAG_RANGE {
         let mut upper: i32 = 0;
-        let lower = unsafe { bindings::ippGetRange(attr, index, &mut upper) };
+        let lower = unsafe { bindings::ippGetRange(attr, element, &mut upper) };
         return Some(IppValue::Range { lower, upper });
     }
 
     if tag == bindings::ipp_tag_e_IPP_TAG_RESOLUTION {
         let mut feed: i32 = 0;
         let mut units: bindings::ipp_res_t = bindings::ipp_res_e_IPP_RES_PER_INCH;
-        let cross_feed = unsafe { bindings::ippGetResolution(attr, index, &mut feed, &mut units) };
+        let cross_feed =
+            unsafe { bindings::ippGetResolution(attr, element, &mut feed, &mut units) };
         return Some(IppValue::Resolution {
             cross_feed,
             feed,
@@ -245,8 +251,8 @@ pub unsafe fn decode_value(attr: *mut bindings::ipp_attribute_t, index: i32) -> 
 /// `attr` must be a valid, non-null `ipp_attribute_t` owned by a live IPP
 /// message.
 pub unsafe fn decode_all(attr: *mut bindings::ipp_attribute_t) -> Vec<IppValue> {
-    let count = unsafe { bindings::ippGetCount(attr) };
-    let mut values = Vec::with_capacity(count.max(0) as usize);
+    let count = count_to_usize(unsafe { bindings::ippGetCount(attr) });
+    let mut values = Vec::with_capacity(count);
     for index in 0..count {
         if let Some(value) = unsafe { decode_value(attr, index) } {
             values.push(value);

@@ -13,6 +13,7 @@ use std::ptr;
 use std::time::Duration;
 
 use crate::bindings;
+use crate::compat::{count_to_usize, usize_to_count};
 use crate::destination::{Destination, DestinationInfo, PrinterState};
 
 use super::attribute::AttributeState;
@@ -291,10 +292,11 @@ impl CupsProvider {
             }
 
             let mut descriptors = Vec::new();
-            let count = unsafe { bindings::ippGetCount(attribute) };
+            let count = count_to_usize(unsafe { bindings::ippGetCount(attribute) });
             for index in 0..count {
                 let media_name = unsafe {
-                    let ptr = bindings::ippGetString(attribute, index, ptr::null_mut());
+                    let ptr =
+                        bindings::ippGetString(attribute, usize_to_count(index), ptr::null_mut());
                     if ptr.is_null() {
                         continue;
                     }
