@@ -61,6 +61,29 @@ impl Deadline {
     }
 }
 
+/// How an [`ProviderHandle::execute_tracked`] call ended.
+pub(crate) enum Delivery<T> {
+    /// The operation ran and its result reached the caller.
+    Completed(ProviderResult<T>),
+    /// The operation was never handed to the provider thread, so it did not
+    /// run and never will.
+    NotDispatched(ProviderError),
+    /// The operation was handed to the provider thread but no result reached
+    /// the caller. It may have run, may still be running, or may have died.
+    Undelivered(Undelivered),
+}
+
+/// Why a dispatched operation's result did not reach its caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Undelivered {
+    /// The caller's deadline passed first. The operation is still running or
+    /// has finished unobserved.
+    TimedOut,
+    /// The provider thread went away without answering (the operation
+    /// panicked). Whatever it had done before that is unknown.
+    WorkerLost,
+}
+
 /// What the provider thread is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ThreadState {
@@ -196,17 +219,52 @@ impl ProviderHandle {
         F: FnOnce() -> ProviderResult<T> + Send + 'static,
         T: Send + 'static,
     {
+        match self.execute_tracked(label, timeout, operation) {
+            Delivery::Completed(outcome) => outcome,
+            Delivery::NotDispatched(err) => Err(err),
+            Delivery::Undelivered(Undelivered::TimedOut) => Err(ProviderError::Timeout {
+                operation: label.to_string(),
+            }),
+            Delivery::Undelivered(Undelivered::WorkerLost) => {
+                Err(ProviderError::InternalContractViolation {
+                    detail: format!("provider thread dropped {label} without answering"),
+                })
+            }
+        }
+    }
+
+    /// [`Self::execute`], but telling the caller whether `operation` was ever
+    /// handed to the provider thread.
+    ///
+    /// For a read the difference does not matter: repeating it is harmless.
+    /// For a job mutation it is the whole question. Work that was never
+    /// dispatched certainly did not happen; work that was dispatched may have
+    /// happened even though no answer arrived, and must not be reported as a
+    /// failure a caller could safely retry.
+    pub(crate) fn execute_tracked<T, F>(
+        &self,
+        label: &str,
+        timeout: Duration,
+        operation: F,
+    ) -> Delivery<T>
+    where
+        F: FnOnce() -> ProviderResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
         let deadline = Deadline::after(Instant::now(), timeout);
 
         // Claim the thread. Callers queue here, and an abandoned request keeps
         // the claim until its libcups call actually returns.
-        let id = self.claim_until(deadline)?;
+        let id = match self.claim_until(deadline) {
+            Ok(id) => id,
+            Err(err) => return Delivery::NotDispatched(err),
+        };
 
         // The claim may have used up the whole budget. Dispatching now would
         // start work nobody waits for, so release the thread untouched.
         if deadline.has_expired(Instant::now()) {
             self.inner.complete(id);
-            return Err(ProviderError::Timeout {
+            return Delivery::NotDispatched(ProviderError::Timeout {
                 operation: label.to_string(),
             });
         }
@@ -225,9 +283,10 @@ impl ProviderHandle {
         });
 
         if let Err(err) = self.dispatch(task) {
-            // Nothing will ever complete this request, so free the thread.
+            // A failed send hands the task back and drops it unrun, so nothing
+            // will ever complete this request: free the thread.
             self.inner.complete(id);
-            return Err(err);
+            return Delivery::NotDispatched(err);
         }
 
         // Only the budget the claim left over. A zero remainder still takes a
@@ -238,20 +297,16 @@ impl ProviderHandle {
         };
 
         match received {
-            Ok(outcome) => outcome,
+            Ok(outcome) => Delivery::Completed(outcome),
             Err(RecvTimeoutError::Timeout) => {
                 // Only marks the request abandoned if it is still running; a
                 // completion that landed in this same instant wins.
                 self.inner.abandon(id);
-                Err(ProviderError::Timeout {
-                    operation: label.to_string(),
-                })
+                Delivery::Undelivered(Undelivered::TimedOut)
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.inner.complete(id);
-                Err(ProviderError::InternalContractViolation {
-                    detail: format!("provider thread dropped {label} without answering"),
-                })
+                Delivery::Undelivered(Undelivered::WorkerLost)
             }
         }
     }
