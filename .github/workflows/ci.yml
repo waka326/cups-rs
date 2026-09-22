@@ -161,9 +161,11 @@ jobs:
 
       # Tests
       #
-      # Tests that need a CUPS daemon skip themselves when one
-      # isn't available. We don't start a daemon here because
-      # the destination-discovery tests expect no printers.
+      # The print-job tests are #[ignore]d and additionally refuse to run
+      # without the allow-print-job-tests feature, which is never enabled
+      # here. A runner that happens to have a printer configured therefore
+      # still cannot be made to print. tests/print_job_safety.rs asserts both
+      # guards are present, so removing one fails the build.
       #
       - name: Test
         run: |
@@ -211,6 +213,8 @@ jobs:
       - name: Build
         run: cargo build --locked
 
-      # Only the lib tests. The integration suite creates CUPS jobs.
-      - name: Test (library only)
-        run: cargo test --locked --lib
+      # The print-job tests are #[ignore]d and gated behind the
+      # allow-print-job-tests feature, which is never enabled here, so the
+      # full suite is safe to run even if a runner has a printer.
+      - name: Test
+        run: cargo test --locked

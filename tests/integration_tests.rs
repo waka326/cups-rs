@@ -14,6 +14,32 @@ fn cups_available() -> bool {
     }
 }
 
+/// Refuse to run a test that would create, cancel or otherwise touch a real
+/// CUPS print job unless this build explicitly opted in.
+///
+/// Tests that reach a printer are guarded twice: they are `#[ignore]`d so a
+/// plain `cargo test` never selects them, and they call this so that even
+/// `--include-ignored` does nothing without the `allow-print-job-tests`
+/// feature. The feature is a compile-time switch, so no environment variable
+/// or stray config can turn printing on at runtime.
+///
+/// To run them deliberately, on a machine whose printers you own:
+///
+/// ```text
+/// cargo test --features allow-print-job-tests -- --ignored --test-threads=1
+/// ```
+///
+/// That will send real jobs to a real printer. Do not run it in CI.
+fn print_job_tests_allowed() -> bool {
+    if cfg!(feature = "allow-print-job-tests") {
+        return true;
+    }
+    println!(
+        "print-job tests are disabled; rebuild with --features allow-print-job-tests to run them"
+    );
+    false
+}
+
 fn get_test_printer() -> Result<Destination> {
     let destinations = get_all_destinations()?;
 
@@ -196,7 +222,12 @@ fn test_integration_printer_capabilities() {
 
 #[test]
 #[serial]
+#[ignore = "creates real CUPS print jobs; see print_job_tests_allowed"]
 fn test_integration_job_lifecycle() {
+    // Creates, cancels or otherwise touches a real CUPS job.
+    if !print_job_tests_allowed() {
+        return;
+    }
     if !cups_available() {
         return;
     }
@@ -284,7 +315,12 @@ fn test_integration_job_lifecycle() {
 
 #[test]
 #[serial]
+#[ignore = "creates real CUPS print jobs; see print_job_tests_allowed"]
 fn test_integration_job_with_options() {
+    // Creates, cancels or otherwise touches a real CUPS job.
+    if !print_job_tests_allowed() {
+        return;
+    }
     if !cups_available() {
         return;
     }
@@ -331,7 +367,12 @@ fn test_integration_job_with_options() {
 
 #[test]
 #[serial]
+#[ignore = "creates real CUPS print jobs; see print_job_tests_allowed"]
 fn test_integration_job_cancellation() {
+    // Creates, cancels or otherwise touches a real CUPS job.
+    if !print_job_tests_allowed() {
+        return;
+    }
     if !cups_available() {
         return;
     }
@@ -421,7 +462,12 @@ fn test_integration_find_destinations_by_type() {
 
 #[test]
 #[serial]
+#[ignore = "creates real CUPS print jobs; see print_job_tests_allowed"]
 fn test_integration_error_handling() {
+    // Creates, cancels or otherwise touches a real CUPS job.
+    if !print_job_tests_allowed() {
+        return;
+    }
     if !cups_available() {
         return;
     }
