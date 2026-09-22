@@ -196,10 +196,16 @@ jobs:
       fail-fast: false
 
       matrix:
-        # macos-14 and later are Apple Silicon; macos-13 is Intel.
+        # macos-14 and later are Apple Silicon.
+        #
+        # macos-13 (Intel) is not included: on two consecutive runs the job sat
+        # queued with no runner ever assigned (no runner name, no steps
+        # started, 33+ and 41 minutes) and had to be cancelled. A job that
+        # never starts proves nothing, and leaving it in makes every run look
+        # unfinished. Intel coverage is therefore unproven rather than
+        # falsely green — add the runner back once one is actually available.
         runner:
           - macos-14
-          - macos-13
 
     steps:
       - uses: actions/checkout@v4
