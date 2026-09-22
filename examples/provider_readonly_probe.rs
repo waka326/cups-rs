@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use cups_rs::provider::{
-    AttributeState, CupsProvider, IppValue, MediaQuery, ReadyMedia, POSTCARD_LENGTH_UM,
-    POSTCARD_WIDTH_UM,
+    AttributeState, CupsProvider, IppValue, MediaQuery, POSTCARD_LENGTH_UM, POSTCARD_WIDTH_UM,
+    ReadyMedia,
 };
 
 /// Generous enough that a slow queue answers rather than reporting a timeout
