@@ -70,14 +70,24 @@ impl CupsProvider {
         })
     }
 
-    /// The default destination, if one is configured.
+    /// The default destination.
+    ///
+    /// `Ok(None)` means the scheduler answered and no destination is marked
+    /// default. A scheduler that could not be reached is an error, not an
+    /// absent default: those are different facts, and a caller planning a
+    /// print needs to tell them apart.
     pub fn get_default_printer(&self, timeout: Duration) -> ProviderResult<Option<PrinterSummary>> {
         self.handle.execute("get_default_printer", timeout, || {
-            match crate::get_default_destination() {
-                Ok(destination) => Ok(Some(summarise(&destination))),
-                // No default configured is an answer, not a failure.
-                Err(_) => Ok(None),
-            }
+            // Enumerate and look for the default flag rather than asking for
+            // the default directly. "No default printer" is then a property of
+            // a list we actually received, instead of an error variant that
+            // cannot be told apart from the scheduler being unreachable.
+            let destinations =
+                crate::get_all_destinations().map_err(|err| ProviderError::ConnectionFailed {
+                    detail: format!("could not list destinations: {err}"),
+                })?;
+
+            Ok(pick_default(&destinations))
         })
     }
 
@@ -210,15 +220,24 @@ impl CupsProvider {
 
                 let count = info.get_media_count(ptr::null_mut(), dest_ptr, flags);
                 let mut media = Vec::with_capacity(count);
+                let mut unreadable = 0usize;
                 for index in 0..count {
-                    // A single unreadable entry should not discard the rest
-                    // of the catalogue.
-                    if let Ok(size) =
-                        info.get_media_by_index(ptr::null_mut(), dest_ptr, index, flags)
-                    {
-                        media.push(descriptor_from(size, query));
+                    // A single unreadable entry should not discard the rest of
+                    // the catalogue, but losing all of them silently would
+                    // look identical to a printer that offers no media.
+                    match info.get_media_by_index(ptr::null_mut(), dest_ptr, index, flags) {
+                        Ok(size) => media.push(descriptor_from(size, query)),
+                        Err(_) => unreadable += 1,
                     }
                 }
+
+                if media.is_empty() && unreadable > 0 {
+                    return Err(ProviderError::CapabilityUnknown {
+                        printer: name.clone(),
+                        attribute: format!("media ({unreadable} entries unreadable)"),
+                    });
+                }
+
                 Ok(media)
             })
     }
@@ -344,6 +363,18 @@ fn summarise(destination: &Destination) -> PrinterSummary {
     }
 }
 
+/// The destination marked default, if the list contains one.
+///
+/// Split out so the "answered, but nothing is default" case can be tested
+/// without a scheduler. A failure to obtain the list never reaches here; the
+/// caller turns that into an error instead.
+fn pick_default(destinations: &[Destination]) -> Option<PrinterSummary> {
+    destinations
+        .iter()
+        .find(|destination| destination.is_default)
+        .map(summarise)
+}
+
 fn lookup(printer: &str) -> ProviderResult<Destination> {
     crate::get_destination(printer).map_err(|_| ProviderError::PrinterNotFound {
         printer: printer.to_string(),
@@ -428,6 +459,56 @@ fn descriptor_from(size: crate::destination::MediaSize, query: MediaQuery) -> Me
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn destination(name: &str, is_default: bool) -> Destination {
+        Destination {
+            name: name.to_string(),
+            instance: None,
+            is_default,
+            options: Default::default(),
+        }
+    }
+
+    #[test]
+    fn genuine_no_default_yields_none() {
+        // The scheduler answered; nothing is marked default. That is a fact
+        // about the configuration, not a failure.
+        let destinations = vec![
+            destination("Canon_TS5400_series", false),
+            destination("EPSON_EW_456A_Series", false),
+        ];
+        assert!(pick_default(&destinations).is_none());
+    }
+
+    #[test]
+    fn empty_destination_list_yields_none() {
+        assert!(pick_default(&[]).is_none());
+    }
+
+    #[test]
+    fn default_printer_is_found_by_flag() {
+        let destinations = vec![
+            destination("Canon_TS5400_series", false),
+            destination("Brother_MFC_7460DN", true),
+            destination("EPSON_EW_456A_Series", false),
+        ];
+        let found = pick_default(&destinations).expect("a default exists");
+        assert_eq!(found.name, "Brother_MFC_7460DN");
+        assert!(found.is_default);
+    }
+
+    #[test]
+    fn query_failure_is_not_an_absent_default() {
+        // get_default_printer maps a failed enumeration to ConnectionFailed.
+        // Nothing in the provider may turn that into Ok(None): "we could not
+        // ask" and "there is no default" lead to different decisions.
+        let failure = ProviderError::ConnectionFailed {
+            detail: "could not list destinations: simulated".into(),
+        };
+        assert!(!failure.is_operator_actionable());
+        // The error carries no printer, because none was identified.
+        assert_eq!(failure.printer(), None);
+    }
 
     #[test]
     fn converts_um_to_cups_units() {

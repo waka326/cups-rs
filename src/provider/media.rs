@@ -89,13 +89,25 @@ pub struct MediaDescriptor {
 }
 
 impl MediaDescriptor {
+    /// Whether the printer gave real dimensions for this media.
+    ///
+    /// Ready media is reported by name; CUPS does not always resolve that name
+    /// to a size. A zero here means "the size was not reported", not a sheet
+    /// with no area, and size comparisons on such an entry are meaningless.
+    pub fn has_known_dimensions(&self) -> bool {
+        self.width_um > 0 && self.length_um > 0
+    }
+
     /// Whether this media is `width_um` x `length_um` within `tolerance_um`.
     ///
     /// Real printers do not always report exact figures — one queue in the
     /// spike reported a 100 x 148 mm card as 100.2 x 147.8 mm — so an exact
     /// comparison would reject media that is physically correct.
     pub fn matches_size(&self, width_um: u32, length_um: u32, tolerance_um: u32) -> bool {
-        within(self.width_um, width_um, tolerance_um)
+        // An entry whose size was never reported matches nothing; treating it
+        // as 0 x 0 would let a large tolerance make it match anything.
+        self.has_known_dimensions()
+            && within(self.width_um, width_um, tolerance_um)
             && within(self.length_um, length_um, tolerance_um)
     }
 }
@@ -255,6 +267,22 @@ mod tests {
         assert!(media.is_postcard_100x148());
         assert!(media.margins.is_full_bleed());
         assert!(media.borderless);
+    }
+
+    #[test]
+    fn media_without_reported_dimensions_matches_nothing() {
+        // Ready media can come back as a name with no resolvable size.
+        let unknown = MediaDescriptor {
+            canonical_name: "jpn_hagaki_100x148mm".into(),
+            width_um: 0,
+            length_um: 0,
+            margins: Margins::default(),
+            borderless: false,
+        };
+        assert!(!unknown.has_known_dimensions());
+        assert!(!unknown.is_postcard_100x148());
+        // Even a wildly generous tolerance must not make it match.
+        assert!(!unknown.matches_size(100_000, 148_000, 1_000_000));
     }
 
     #[test]
