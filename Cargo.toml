@@ -31,6 +31,10 @@ bindgen = "0.71.1"
 pkg-config = "0.3.32"
 
 [[example]]
+name = "provider_readonly_probe"
+path = "examples/provider_readonly_probe.rs"
+
+[[example]]
 name = "discover_printers"
 path = "examples/discover_printers.rs"
 
