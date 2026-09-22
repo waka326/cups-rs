@@ -54,7 +54,7 @@ impl CupsProvider {
     pub fn new() -> ProviderResult<Self> {
         let handle = ProviderHandle::new()?;
         Ok(Self {
-            jobs: JobService::new(handle.clone(), CupsJobBackend::default()),
+            jobs: JobService::new(handle.clone(), CupsJobBackend::default())?,
             handle,
         })
     }

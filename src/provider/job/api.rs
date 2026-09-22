@@ -5,10 +5,10 @@ use std::time::Duration;
 use crate::provider::api::CupsProvider;
 use crate::provider::error::ProviderResult;
 
+use super::handle::ProviderJobHandle;
 use super::options::ProviderJobOptions;
 use super::types::{
-    CancelOutcome, CancelProgress, CreatedJob, ProviderJobHandle, ProviderJobId, ProviderJobStage,
-    ProviderJobStatus,
+    CancelOutcome, CancelProgress, CreatedJob, ProviderJobId, ProviderJobStage, ProviderJobStatus,
 };
 
 impl CupsProvider {
@@ -69,6 +69,9 @@ impl CupsProvider {
 
     /// Where a handle stands, including results that arrived after their
     /// caller timed out.
+    ///
+    /// Every method that takes a handle refuses one this provider did not
+    /// issue with `UnknownJobHandle`, before changing or sending anything.
     pub fn job_stage(&self, handle: ProviderJobHandle) -> ProviderResult<ProviderJobStage> {
         self.jobs.stage(handle)
     }

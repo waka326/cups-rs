@@ -8,30 +8,7 @@ use std::num::NonZeroU32;
 
 use crate::provider::error::{ProviderError, ProviderResult};
 
-/// This provider's name for one requested job, allocated before anything is
-/// sent to CUPS.
-///
-/// It exists so a job can be followed even when the scheduler's answer never
-/// reached the caller: a create that times out after dispatch still has a
-/// handle, and the job id it eventually produces is recorded against it.
-///
-/// A handle is meaningful only to the provider that issued it. It is not a
-/// pointer, and it does not survive the provider; persist the
-/// [`ProviderJobId`] instead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ProviderJobHandle(u64);
-
-impl ProviderJobHandle {
-    pub(crate) fn from_raw(value: u64) -> Self {
-        Self(value)
-    }
-}
-
-impl fmt::Display for ProviderJobHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "job-handle-{}", self.0)
-    }
-}
+use super::handle::ProviderJobHandle;
 
 /// A CUPS job, identified by the scheduler's job id together with the
 /// destination it was created on.

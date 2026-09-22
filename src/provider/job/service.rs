@@ -21,11 +21,12 @@ use crate::provider::error::{ProviderError, ProviderResult};
 use crate::provider::worker::{Delivery, ProviderHandle, Undelivered};
 
 use super::backend::{CreateAccepted, JobBackend, MutationFailure};
+use super::handle::ProviderJobHandle;
 use super::options::ProviderJobOptions;
 use super::registry::Registry;
 use super::types::{
-    CancelOutcome, CancelProgress, CreatedJob, JobOperation, ProviderJobHandle, ProviderJobId,
-    ProviderJobStage, ProviderJobStatus, SubmitPhase,
+    CancelOutcome, CancelProgress, CreatedJob, JobOperation, ProviderJobId, ProviderJobStage,
+    ProviderJobStatus, SubmitPhase,
 };
 use super::validate::{validate_pdf, validate_printer, validate_title};
 
@@ -54,12 +55,15 @@ struct Tracked {
 impl<B: JobBackend> JobService<B> {
     /// Share `worker` with the read-only API: one thread serialises every
     /// libcups call, whichever API issued it.
-    pub fn new(worker: ProviderHandle, backend: B) -> Self {
-        Self {
+    ///
+    /// Each service gets a registry identity no other service in the process
+    /// has, so its handles cannot be used on — or collide with — another's.
+    pub fn new(worker: ProviderHandle, backend: B) -> ProviderResult<Self> {
+        Ok(Self {
             worker,
             backend: Arc::new(Mutex::new(backend)),
-            registry: Arc::new(Mutex::new(Registry::default())),
-        }
+            registry: Arc::new(Mutex::new(Registry::new()?)),
+        })
     }
 
     /// Create an empty job on exactly `printer`.
@@ -78,7 +82,7 @@ impl<B: JobBackend> JobService<B> {
         validate_title(title)?;
         let attributes = options.to_attributes()?;
 
-        let handle = lock(&self.registry)?.begin_create();
+        let handle = lock(&self.registry)?.begin_create()?;
         let backend = Arc::clone(&self.backend);
         let registry = Arc::clone(&self.registry);
         let printer = printer.to_string();
@@ -89,7 +93,7 @@ impl<B: JobBackend> JobService<B> {
                 .map_err(MutationFailure::NotSent)
                 .and_then(|mut backend| backend.create_job(&printer, &title, &attributes));
             let (stage, outcome) = settle_create(handle, &printer, result);
-            lock(&registry)?.settle(handle, stage);
+            lock(&registry)?.settle(handle, stage)?;
             outcome
         });
 
@@ -109,7 +113,7 @@ impl<B: JobBackend> JobService<B> {
         if let Err(err) = &result
             && !err.is_outcome_unknown()
         {
-            lock(&self.registry)?.discard(handle);
+            lock(&self.registry)?.discard(handle)?;
         }
         result
     }
@@ -151,7 +155,7 @@ impl<B: JobBackend> JobService<B> {
                     .map_err(|err| SubmitStop::before_start(MutationFailure::NotSent(err)))
                     .and_then(|mut backend| send_document(&mut *backend, &task_job, &document));
                 let (stage, outcome) = settle_submit(handle, &task_job, result);
-                lock(&registry)?.settle(handle, stage);
+                lock(&registry)?.settle(handle, stage)?;
                 outcome
             });
 
@@ -188,7 +192,7 @@ impl<B: JobBackend> JobService<B> {
                 .map_err(MutationFailure::NotSent)
                 .and_then(|mut backend| backend.close_job(&task_job));
             let (stage, outcome) = settle_close(handle, &task_job, result);
-            lock(&registry)?.settle(handle, stage);
+            lock(&registry)?.settle(handle, stage)?;
             outcome
         });
 
@@ -276,6 +280,11 @@ impl<B: JobBackend> JobService<B> {
         lock(&self.registry)?.release(handle)
     }
 
+    #[cfg(test)]
+    pub fn tracked_handles(&self) -> usize {
+        lock(&self.registry).map_or(0, |registry| registry.tracked_handles())
+    }
+
     /// Turn a delivery into the caller's answer, fixing up the stage when
     /// the operation itself could not.
     fn conclude<T>(&self, tracked: Tracked, delivery: Delivery<T>) -> ProviderResult<T> {
@@ -286,8 +295,8 @@ impl<B: JobBackend> JobService<B> {
             Delivery::NotDispatched(err) => {
                 let mut registry = lock(&self.registry)?;
                 match tracked.before {
-                    Some(before) => registry.restore(tracked.handle, &tracked.in_flight, before),
-                    None => registry.discard(tracked.handle),
+                    Some(before) => registry.restore(tracked.handle, &tracked.in_flight, before)?,
+                    None => registry.discard(tracked.handle)?,
                 }
                 Err(err)
             }
@@ -295,7 +304,11 @@ impl<B: JobBackend> JobService<B> {
                 // A timed-out operation is still running and will record its
                 // own outcome. One whose thread died never will.
                 if why == Undelivered::WorkerLost {
-                    lock(&self.registry)?.restore(tracked.handle, &tracked.in_flight, tracked.lost);
+                    lock(&self.registry)?.restore(
+                        tracked.handle,
+                        &tracked.in_flight,
+                        tracked.lost,
+                    )?;
                 }
                 Err(outcome_unknown(
                     tracked.operation,

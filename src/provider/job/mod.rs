@@ -23,6 +23,7 @@
 mod api;
 mod backend;
 mod cups_backend;
+mod handle;
 mod options;
 mod registry;
 mod service;
@@ -35,9 +36,10 @@ mod fake;
 mod service_tests;
 
 pub(crate) use cups_backend::CupsJobBackend;
+pub use handle::ProviderJobHandle;
 pub use options::{ColorMode, JobMedia, JobMediaSize, PrintQuality, ProviderJobOptions, Sides};
 pub(crate) use service::JobService;
 pub use types::{
-    CancelOutcome, CancelProgress, CreatedJob, JobOperation, JobRejection, ProviderJobHandle,
-    ProviderJobId, ProviderJobStage, ProviderJobStatus, SubmitPhase,
+    CancelOutcome, CancelProgress, CreatedJob, JobOperation, JobRejection, ProviderJobId,
+    ProviderJobStage, ProviderJobStatus, SubmitPhase,
 };
