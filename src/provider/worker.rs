@@ -13,7 +13,7 @@
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::error::{ProviderError, ProviderResult};
 
@@ -27,6 +27,39 @@ type Task = Box<dyn FnOnce() + Send + 'static>;
 /// finishing at the same moment its caller gives up cannot wipe the state of
 /// whatever runs next.
 type RequestId = u64;
+
+/// The single point in time by which one `execute` call must answer.
+///
+/// Fixed once per call, so every wait inside that call — queueing for the
+/// thread, then waiting for the result — spends the same budget instead of
+/// each starting a fresh `timeout` window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Deadline {
+    /// `None` when `start + timeout` does not fit in an `Instant`; such a
+    /// timeout is effectively unbounded.
+    at: Option<Instant>,
+}
+
+impl Deadline {
+    fn after(start: Instant, timeout: Duration) -> Self {
+        Self {
+            at: start.checked_add(timeout),
+        }
+    }
+
+    /// Budget left at `now`: `None` when unbounded, `Some(ZERO)` once expired.
+    ///
+    /// Always measured against the fixed deadline, so waking early — whether
+    /// spuriously or because of an unrelated notification — shrinks what is
+    /// left rather than restarting it.
+    fn remaining(self, now: Instant) -> Option<Duration> {
+        self.at.map(|at| at.saturating_duration_since(now))
+    }
+
+    fn has_expired(self, now: Instant) -> bool {
+        self.remaining(now).is_some_and(|left| left.is_zero())
+    }
+}
 
 /// What the provider thread is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +174,11 @@ impl ProviderHandle {
 
     /// Run `operation` on the provider thread and wait up to `timeout`.
     ///
+    /// `timeout` is one budget for the whole call: time spent queueing behind
+    /// other callers counts against it, and only what is left is spent
+    /// waiting for the result. If the budget is gone by the time the thread is
+    /// claimed, `operation` is not dispatched at all.
+    ///
     /// On timeout the caller gets [`ProviderError::Timeout`] while the
     /// operation keeps running: libcups cannot be interrupted, and unwinding
     /// a thread mid-FFI is not safe. Two things follow, and both are part of
@@ -158,9 +196,20 @@ impl ProviderHandle {
         F: FnOnce() -> ProviderResult<T> + Send + 'static,
         T: Send + 'static,
     {
+        let deadline = Deadline::after(Instant::now(), timeout);
+
         // Claim the thread. Callers queue here, and an abandoned request keeps
         // the claim until its libcups call actually returns.
-        let id = self.claim(timeout)?;
+        let id = self.claim_until(deadline)?;
+
+        // The claim may have used up the whole budget. Dispatching now would
+        // start work nobody waits for, so release the thread untouched.
+        if deadline.has_expired(Instant::now()) {
+            self.inner.complete(id);
+            return Err(ProviderError::Timeout {
+                operation: label.to_string(),
+            });
+        }
 
         let (result_tx, result_rx) = mpsc::channel();
         let inner = Arc::clone(&self.inner);
@@ -181,7 +230,14 @@ impl ProviderHandle {
             return Err(err);
         }
 
-        match result_rx.recv_timeout(timeout) {
+        // Only the budget the claim left over. A zero remainder still takes a
+        // result that is already waiting.
+        let received = match deadline.remaining(Instant::now()) {
+            Some(left) => result_rx.recv_timeout(left),
+            None => result_rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+
+        match received {
             Ok(outcome) => outcome,
             Err(RecvTimeoutError::Timeout) => {
                 // Only marks the request abandoned if it is still running; a
@@ -202,29 +258,32 @@ impl ProviderHandle {
 
     /// Wait for the thread to be idle, then claim it for a new request.
     ///
-    /// Waiting is bounded by the caller's own timeout, so a stuck abandoned
-    /// call cannot block a caller indefinitely.
-    fn claim(&self, timeout: Duration) -> ProviderResult<RequestId> {
-        let mut state =
-            self.inner
-                .state
-                .lock()
-                .map_err(|_| ProviderError::InternalContractViolation {
-                    detail: "provider state poisoned".into(),
-                })?;
+    /// Waiting is bounded by the caller's deadline, so a stuck abandoned call
+    /// cannot block a caller indefinitely. Each wake-up recomputes what is
+    /// left of that deadline; a spurious or unrelated wake-up never grants a
+    /// fresh window.
+    fn claim_until(&self, deadline: Deadline) -> ProviderResult<RequestId> {
+        let poisoned = || ProviderError::InternalContractViolation {
+            detail: "provider state poisoned".into(),
+        };
+        let mut state = self.inner.state.lock().map_err(|_| poisoned())?;
 
         while state.0 != ThreadState::Idle {
-            let (next, wait) = self.inner.idle.wait_timeout(state, timeout).map_err(|_| {
-                ProviderError::InternalContractViolation {
-                    detail: "provider state poisoned".into(),
+            state = match deadline.remaining(Instant::now()) {
+                Some(left) if left.is_zero() => {
+                    return Err(ProviderError::Timeout {
+                        operation: "waiting for the provider thread to become available".into(),
+                    });
                 }
-            })?;
-            state = next;
-            if wait.timed_out() && state.0 != ThreadState::Idle {
-                return Err(ProviderError::Timeout {
-                    operation: "waiting for the provider thread to become available".into(),
-                });
-            }
+                Some(left) => {
+                    self.inner
+                        .idle
+                        .wait_timeout(state, left)
+                        .map_err(|_| poisoned())?
+                        .0
+                }
+                None => self.inner.idle.wait(state).map_err(|_| poisoned())?,
+            };
         }
 
         state.1 = state.1.wrapping_add(1);
@@ -630,6 +689,209 @@ mod tests {
         wait_until(|| !handle.is_busy());
         thread::sleep(Duration::from_millis(50));
         assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// Occupy the provider for `hold` on a background thread and return once
+    /// the operation is actually running.
+    fn occupy(handle: &ProviderHandle, hold: Duration) -> thread::JoinHandle<()> {
+        let started = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&started);
+        let handle = handle.clone();
+        let occupant = thread::spawn(move || {
+            handle
+                .execute("occupant", GENEROUS, move || {
+                    flag.store(true, Ordering::SeqCst);
+                    thread::sleep(hold);
+                    Ok(())
+                })
+                .expect("occupant finishes within its own budget");
+        });
+        wait_until(|| started.load(Ordering::SeqCst));
+        occupant
+    }
+
+    #[test]
+    fn queue_wait_and_result_wait_share_one_deadline() {
+        // The second caller spends most of its budget queueing; its operation
+        // must not then get a whole new budget. With one deadline the call
+        // ends near TIMEOUT; with the old per-phase budgets it ended near
+        // HOLD + TIMEOUT.
+        const HOLD: Duration = Duration::from_millis(300);
+        const TIMEOUT: Duration = Duration::from_millis(400);
+        // Midway between one budget (400ms) and the double one (700ms).
+        const CEILING: Duration = Duration::from_millis(580);
+
+        let handle = ProviderHandle::new().expect("thread starts");
+        let occupant = occupy(&handle, HOLD);
+
+        let start = Instant::now();
+        let result = handle.execute("queued slow", TIMEOUT, || {
+            thread::sleep(Duration::from_millis(600));
+            Ok(())
+        });
+        let elapsed = start.elapsed();
+
+        assert!(matches!(result, Err(ProviderError::Timeout { .. })));
+        assert!(
+            elapsed >= TIMEOUT,
+            "returned before its deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < CEILING,
+            "queue wait and result wait were budgeted separately: {elapsed:?}"
+        );
+
+        occupant.join().expect("occupant joins");
+        wait_until(|| !handle.is_busy());
+    }
+
+    #[test]
+    fn caller_timing_out_in_the_queue_never_dispatches() {
+        const TIMEOUT: Duration = Duration::from_millis(200);
+        // One budget plus scheduling slack, well short of two budgets.
+        const CEILING: Duration = Duration::from_millis(340);
+
+        let handle = ProviderHandle::new().expect("thread starts");
+        let occupant = occupy(&handle, Duration::from_millis(700));
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+
+        let start = Instant::now();
+        let result = handle.execute("never runs", TIMEOUT, move || {
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let elapsed = start.elapsed();
+
+        assert!(matches!(result, Err(ProviderError::Timeout { .. })));
+        assert!(
+            elapsed >= TIMEOUT,
+            "returned before its deadline: {elapsed:?}"
+        );
+        assert!(elapsed < CEILING, "queued caller overran: {elapsed:?}");
+
+        occupant.join().expect("occupant joins");
+        // Give a wrongly dispatched operation every chance to show up.
+        assert_eq!(handle.execute("after", GENEROUS, || Ok(1)).expect("ok"), 1);
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "timed-out caller was dispatched"
+        );
+    }
+
+    #[test]
+    fn unrelated_wakeups_do_not_reset_the_queue_deadline() {
+        // Keep waking the queued caller without ever freeing the thread. Each
+        // wake-up used to restart the full timeout, so the caller only left
+        // once the occupant finished. It must leave on its own deadline.
+        const TIMEOUT: Duration = Duration::from_millis(150);
+        const CEILING: Duration = Duration::from_millis(400);
+
+        let handle = ProviderHandle::new().expect("thread starts");
+        let occupant = occupy(&handle, Duration::from_millis(900));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let notifier = {
+            let handle = handle.clone();
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    handle.inner.idle.notify_all();
+                    thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+
+        let start = Instant::now();
+        let result = handle.execute("woken often", TIMEOUT, || Ok(()));
+        let elapsed = start.elapsed();
+
+        stop.store(true, Ordering::SeqCst);
+        notifier.join().expect("notifier joins");
+        occupant.join().expect("occupant joins");
+
+        assert!(
+            matches!(result, Err(ProviderError::Timeout { .. })),
+            "caller outlived its deadline and ran: {result:?} after {elapsed:?}"
+        );
+        assert!(
+            elapsed < CEILING,
+            "wake-ups extended the deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn queued_caller_succeeds_within_the_remaining_budget() {
+        let handle = ProviderHandle::new().expect("thread starts");
+        let occupant = occupy(&handle, Duration::from_millis(100));
+
+        let value = handle
+            .execute("queued fast", Duration::from_secs(2), || {
+                thread::sleep(Duration::from_millis(50));
+                Ok(42)
+            })
+            .expect("fits in what is left of the budget");
+
+        assert_eq!(value, 42);
+        occupant.join().expect("occupant joins");
+    }
+
+    #[test]
+    fn deadline_remaining_is_cumulative() {
+        let start = Instant::now();
+        let deadline = Deadline::after(start, Duration::from_millis(100));
+
+        // Every re-check measures against the same point, so repeated early
+        // wake-ups only ever shrink the budget.
+        let checks = [0u64, 30, 60, 90, 100, 150].map(|ms| {
+            deadline
+                .remaining(start + Duration::from_millis(ms))
+                .expect("bounded")
+        });
+        assert_eq!(
+            checks,
+            [100u64, 70, 40, 10, 0, 0].map(Duration::from_millis),
+        );
+        assert!(!deadline.has_expired(start + Duration::from_millis(99)));
+        assert!(deadline.has_expired(start + Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn deadline_overflow_is_unbounded_not_expired() {
+        let start = Instant::now();
+        let deadline = Deadline::after(start, Duration::MAX);
+        assert_eq!(deadline.remaining(start), None);
+        assert!(!deadline.has_expired(start));
+    }
+
+    #[test]
+    fn zero_timeout_never_dispatches() {
+        // With no budget at all there is nobody to wait for the result, so the
+        // operation must not be started behind the caller's back.
+        let handle = ProviderHandle::new().expect("thread starts");
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+
+        let result = handle.execute("zero", Duration::ZERO, move || {
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(ProviderError::Timeout { .. })));
+        assert!(!handle.is_busy(), "an undispatched claim must be released");
+        assert_eq!(handle.execute("after", GENEROUS, || Ok(1)).expect("ok"), 1);
+        assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn huge_timeout_still_runs_normally() {
+        let handle = ProviderHandle::new().expect("thread starts");
+        assert_eq!(
+            handle
+                .execute("unbounded", Duration::MAX, || Ok(9))
+                .expect("ok"),
+            9
+        );
     }
 
     #[test]
