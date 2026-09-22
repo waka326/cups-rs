@@ -187,6 +187,9 @@ pub mod job;
 /// - Get option values with type conversion
 pub mod options;
 
+/// Nenga provider contract: typed, read-only capability access.
+pub mod provider;
+
 pub use connection::{ConnectionFlags, HttpConnection, connect_to_destination};
 pub use constants::*;
 pub use destination::{
