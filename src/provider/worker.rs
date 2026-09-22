@@ -160,10 +160,7 @@ impl ProviderHandle {
     {
         // Claim the thread. Callers queue here, and an abandoned request keeps
         // the claim until its libcups call actually returns.
-        let id = match self.claim(timeout) {
-            Ok(id) => id,
-            Err(err) => return Err(err),
-        };
+        let id = self.claim(timeout)?;
 
         let (result_tx, result_rx) = mpsc::channel();
         let inner = Arc::clone(&self.inner);
@@ -276,10 +273,10 @@ impl Drop for HandleInner {
         if let Ok(mut guard) = self.sender.lock() {
             guard.take();
         }
-        if let Ok(mut guard) = self.worker.lock() {
-            if let Some(handle) = guard.take() {
-                let _ = handle.join();
-            }
+        if let Ok(mut guard) = self.worker.lock()
+            && let Some(handle) = guard.take()
+        {
+            let _ = handle.join();
         }
     }
 }

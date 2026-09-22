@@ -70,14 +70,10 @@ pub fn parse_link_flags(libs: &str) -> LinkFlags {
     let mut parsed = LinkFlags::default();
 
     for flag in libs.split_whitespace() {
-        if let Some(dir) = flag.strip_prefix("-L") {
-            if !dir.is_empty() {
-                parsed.search_paths.push(dir.to_string());
-            }
-        } else if let Some(lib) = flag.strip_prefix("-l") {
-            if !lib.is_empty() {
-                parsed.libs.push(lib.to_string());
-            }
+        if let Some(dir) = flag.strip_prefix("-L").filter(|dir| !dir.is_empty()) {
+            parsed.search_paths.push(dir.to_string());
+        } else if let Some(lib) = flag.strip_prefix("-l").filter(|lib| !lib.is_empty()) {
+            parsed.libs.push(lib.to_string());
         }
     }
 
