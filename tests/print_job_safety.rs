@@ -80,3 +80,59 @@ fn guard_helper_is_compile_time_not_environment_driven() {
         "the guard must not be switchable by an environment variable at runtime"
     );
 }
+
+/// The provider's job lifecycle is tested only against its in-crate fake
+/// backend. No integration test or example may drive it against CUPS: a
+/// default `cargo test` compiles every example, and a provider job created
+/// by mistake is a real job on a real printer.
+const PROVIDER_JOB_CALLS: &[&str] = &[
+    "create_job",
+    "submit_pdf_bytes",
+    "close_job",
+    "cancel_job",
+    "ProviderJobOptions",
+];
+
+fn sources_under(directory: &str) -> Vec<(std::path::PathBuf, String)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(directory);
+    let mut sources = Vec::new();
+    let mut pending = vec![root];
+    while let Some(path) = pending.pop() {
+        let entries = std::fs::read_dir(&path).expect("directory is readable");
+        for entry in entries {
+            let path = entry.expect("entry is readable").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path).expect("source is readable");
+                sources.push((path, source));
+            }
+        }
+    }
+    sources
+}
+
+#[test]
+fn no_test_or_example_drives_the_provider_job_api() {
+    for directory in ["tests", "examples"] {
+        for (path, source) in sources_under(directory) {
+            // This file names the calls in order to forbid them.
+            if path.ends_with("print_job_safety.rs") {
+                continue;
+            }
+            let uses_provider = source.contains("CupsProvider") || source.contains("provider::");
+            if source.contains("submit_pdf_bytes") || source.contains("ProviderJobOptions") {
+                panic!("{} uses the provider job API", path.display());
+            }
+            if uses_provider {
+                for call in PROVIDER_JOB_CALLS {
+                    assert!(
+                        !source.contains(call),
+                        "{} uses the provider and mentions {call}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}
