@@ -5,8 +5,7 @@
 //! CUPS media flags, no knowledge of how the library was located at build
 //! time.
 //!
-//! Job submission is deliberately absent. Nothing here creates, modifies or
-//! cancels a CUPS job.
+//! The job lifecycle lives in [`super::job`] and shares this type's thread.
 
 use std::ffi::CStr;
 use std::ptr;
@@ -18,6 +17,7 @@ use crate::destination::{Destination, DestinationInfo, PrinterState};
 
 use super::attribute::AttributeState;
 use super::error::{ProviderError, ProviderResult};
+use super::job::{CupsJobBackend, JobService};
 use super::media::{Margins, MediaDescriptor, MediaQuery, ReadyMedia, cups_units_to_um};
 use super::value::{IppValue, decode_all};
 use super::worker::ProviderHandle;
@@ -45,12 +45,17 @@ pub struct PrinterSummary {
 /// than run in parallel.
 pub struct CupsProvider {
     handle: ProviderHandle,
+    /// Job operations run on the same thread as `handle`'s reads: one
+    /// thread serialises every libcups call this provider makes.
+    pub(in crate::provider) jobs: JobService<CupsJobBackend>,
 }
 
 impl CupsProvider {
     pub fn new() -> ProviderResult<Self> {
+        let handle = ProviderHandle::new()?;
         Ok(Self {
-            handle: ProviderHandle::new()?,
+            jobs: JobService::new(handle.clone(), CupsJobBackend::default()),
+            handle,
         })
     }
 

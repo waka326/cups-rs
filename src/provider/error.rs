@@ -7,6 +7,10 @@
 
 use std::fmt;
 
+use super::job::{
+    JobOperation, JobRejection, ProviderJobHandle, ProviderJobId, ProviderJobStage, SubmitPhase,
+};
+
 /// Why a provider operation did not produce an answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderError {
@@ -36,6 +40,94 @@ pub enum ProviderError {
     Timeout { operation: String },
     /// The provider violated one of its own invariants. A bug.
     InternalContractViolation { detail: String },
+
+    // --- Job lifecycle ------------------------------------------------------
+    //
+    // Job errors fall into four groups, and a caller must be able to tell them
+    // apart without reading `detail`:
+    //
+    // - rejected locally, nothing sent: `InvalidJobRequest`, `JobStateConflict`,
+    //   `JobOperationInProgress`, `UnknownJobHandle`, and `Timeout` from a job
+    //   operation (it expired before dispatch);
+    // - the scheduler answered and refused: `JobCreateFailed`,
+    //   `JobSubmitFailed`, `JobCloseFailed`, `JobCancelFailed`;
+    // - the outcome is not known: `JobOutcomeUnknown`. Never a safe retry;
+    // - a status question could not be answered: `JobNotFound`,
+    //   `JobStatusQueryFailed`, `JobDestinationMismatch`.
+    /// The request was malformed and was rejected before anything was sent.
+    InvalidJobRequest { detail: String },
+    /// The operation is not valid in the job's current stage. Nothing was
+    /// sent.
+    JobStateConflict {
+        handle: ProviderJobHandle,
+        operation: JobOperation,
+        stage: ProviderJobStage,
+    },
+    /// An earlier request of the same kind for this job is dispatched and
+    /// unanswered. Nothing was sent.
+    JobOperationInProgress {
+        job: ProviderJobId,
+        operation: JobOperation,
+    },
+    /// The handle was not issued by this provider, or was released.
+    UnknownJobHandle { handle: ProviderJobHandle },
+    /// The scheduler refused to create the job. No job exists.
+    JobCreateFailed {
+        printer: String,
+        reason: JobRejection,
+        detail: String,
+    },
+    /// The document was not accepted. The job exists and is still open.
+    ///
+    /// `reason` is present when the scheduler answered with a refusal, and
+    /// absent when the connection failed before the document was complete —
+    /// a scheduler only attaches a document once the whole request has
+    /// arrived, so either way the document was not accepted.
+    JobSubmitFailed {
+        job: ProviderJobId,
+        phase: SubmitPhase,
+        bytes_sent: u64,
+        reason: Option<JobRejection>,
+        detail: String,
+    },
+    /// The scheduler refused to close the job. It is still open.
+    JobCloseFailed {
+        job: ProviderJobId,
+        reason: JobRejection,
+        detail: String,
+    },
+    /// The scheduler refused to cancel the job.
+    JobCancelFailed {
+        job: ProviderJobId,
+        reason: JobRejection,
+        detail: String,
+    },
+    /// A job operation was dispatched and whether it took effect is not
+    /// known.
+    ///
+    /// Not a failure and not safe to retry: repeating a create may produce a
+    /// second job and a second print. `in_flight` means the caller gave up
+    /// while the operation was still running; its result will be recorded
+    /// against `handle` (or, for a cancel, against `job`) when it returns.
+    /// Otherwise the operation finished without an answer anyone could read.
+    JobOutcomeUnknown {
+        operation: JobOperation,
+        handle: Option<ProviderJobHandle>,
+        job: Option<ProviderJobId>,
+        in_flight: bool,
+        detail: String,
+    },
+    /// The scheduler says the job does not exist. Not the same as completed:
+    /// finished jobs are listed until the scheduler's history is purged.
+    JobNotFound { job: ProviderJobId },
+    /// The job's status could not be determined. Says nothing about the job.
+    JobStatusQueryFailed { job: ProviderJobId, detail: String },
+    /// The scheduler has a job with this id, but on a different destination.
+    /// Nothing was changed.
+    JobDestinationMismatch {
+        job: ProviderJobId,
+        reported_printer: String,
+    },
 }
 
 impl ProviderError {
@@ -47,9 +139,24 @@ impl ProviderError {
             | Self::PrinterNotAccepting { printer }
             | Self::CapabilityUnknown { printer, .. }
             | Self::CapabilityUnsupported { printer, .. }
-            | Self::MediaUnknown { printer, .. } => Some(printer),
+            | Self::MediaUnknown { printer, .. }
+            | Self::JobCreateFailed { printer, .. } => Some(printer),
+            Self::JobSubmitFailed { job, .. }
+            | Self::JobCloseFailed { job, .. }
+            | Self::JobCancelFailed { job, .. }
+            | Self::JobOperationInProgress { job, .. }
+            | Self::JobNotFound { job }
+            | Self::JobStatusQueryFailed { job, .. }
+            | Self::JobDestinationMismatch { job, .. } => Some(job.printer()),
+            Self::JobOutcomeUnknown { job, .. } => job.as_ref().map(ProviderJobId::printer),
             _ => None,
         }
+    }
+
+    /// Whether a job operation was dispatched with an outcome nobody could
+    /// observe. Such an error must never be treated as a retriable failure.
+    pub fn is_outcome_unknown(&self) -> bool {
+        matches!(self, Self::JobOutcomeUnknown { .. })
     }
 
     /// Whether the cause is something a person at the printer could resolve
@@ -95,6 +202,67 @@ impl fmt::Display for ProviderError {
             Self::InternalContractViolation { detail } => {
                 write!(f, "provider contract violation: {detail}")
             }
+            Self::InvalidJobRequest { detail } => write!(f, "invalid job request: {detail}"),
+            Self::JobStateConflict {
+                handle,
+                operation,
+                stage,
+            } => write!(f, "cannot {operation} {handle} in stage {stage:?}"),
+            Self::JobOperationInProgress { job, operation } => {
+                write!(f, "a {operation} request for job {job} is still in flight")
+            }
+            Self::UnknownJobHandle { handle } => write!(f, "unknown job handle {handle}"),
+            Self::JobCreateFailed {
+                printer,
+                reason,
+                detail,
+            } => write!(
+                f,
+                "job creation on {printer} refused ({reason:?}): {detail}"
+            ),
+            Self::JobSubmitFailed {
+                job,
+                phase,
+                bytes_sent,
+                reason,
+                detail,
+            } => write!(
+                f,
+                "document for job {job} not accepted at {phase:?} after {bytes_sent} bytes \
+                 ({reason:?}): {detail}"
+            ),
+            Self::JobCloseFailed {
+                job,
+                reason,
+                detail,
+            } => write!(f, "close of job {job} refused ({reason:?}): {detail}"),
+            Self::JobCancelFailed {
+                job,
+                reason,
+                detail,
+            } => write!(f, "cancel of job {job} refused ({reason:?}): {detail}"),
+            Self::JobOutcomeUnknown {
+                operation,
+                handle,
+                job,
+                in_flight,
+                detail,
+            } => write!(
+                f,
+                "outcome of {operation} unknown (handle {handle:?}, job {job:?}, \
+                 in flight {in_flight}): {detail}"
+            ),
+            Self::JobNotFound { job } => write!(f, "job {job} not found"),
+            Self::JobStatusQueryFailed { job, detail } => {
+                write!(f, "status of job {job} could not be read: {detail}")
+            }
+            Self::JobDestinationMismatch {
+                job,
+                reported_printer,
+            } => write!(
+                f,
+                "job {job} belongs to {reported_printer}, not the expected printer"
+            ),
         }
     }
 }

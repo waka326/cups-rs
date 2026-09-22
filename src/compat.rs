@@ -43,3 +43,59 @@ pub(crate) fn cups_bool(value: std::os::raw::c_int) -> bool {
 pub(crate) fn cups_bool(value: bool) -> bool {
     value
 }
+
+/// The user CUPS will attribute requests to. Renamed in CUPS 3.
+#[cfg(cups2)]
+pub(crate) fn cups_user() -> *const std::os::raw::c_char {
+    unsafe { crate::bindings::cupsUser() }
+}
+
+#[cfg(cups3)]
+pub(crate) fn cups_user() -> *const std::os::raw::c_char {
+    unsafe { crate::bindings::cupsGetUser() }
+}
+
+/// An IPP boolean argument: a C `char` in CUPS 2, a `bool` in CUPS 3.
+#[cfg(cups2)]
+pub(crate) fn ipp_boolean(value: bool) -> std::os::raw::c_char {
+    std::os::raw::c_char::from(value)
+}
+
+#[cfg(cups3)]
+pub(crate) fn ipp_boolean(value: bool) -> bool {
+    value
+}
+
+/// Attribute iteration. Renamed `ippGet{First,Next}Attribute` in CUPS 3.
+///
+/// # Safety
+/// `ipp` must be a valid IPP message.
+#[cfg(cups2)]
+pub(crate) unsafe fn ipp_first_attribute(
+    ipp: *mut crate::bindings::ipp_t,
+) -> *mut crate::bindings::ipp_attribute_t {
+    unsafe { crate::bindings::ippFirstAttribute(ipp) }
+}
+
+#[cfg(cups3)]
+pub(crate) unsafe fn ipp_first_attribute(
+    ipp: *mut crate::bindings::ipp_t,
+) -> *mut crate::bindings::ipp_attribute_t {
+    unsafe { crate::bindings::ippGetFirstAttribute(ipp) }
+}
+
+/// # Safety
+/// `ipp` must be a valid IPP message being iterated.
+#[cfg(cups2)]
+pub(crate) unsafe fn ipp_next_attribute(
+    ipp: *mut crate::bindings::ipp_t,
+) -> *mut crate::bindings::ipp_attribute_t {
+    unsafe { crate::bindings::ippNextAttribute(ipp) }
+}
+
+#[cfg(cups3)]
+pub(crate) unsafe fn ipp_next_attribute(
+    ipp: *mut crate::bindings::ipp_t,
+) -> *mut crate::bindings::ipp_attribute_t {
+    unsafe { crate::bindings::ippGetNextAttribute(ipp) }
+}
