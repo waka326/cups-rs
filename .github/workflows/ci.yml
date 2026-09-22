@@ -168,3 +168,49 @@ jobs:
       - name: Test
         run: |
           cargo test --locked --features ${{ matrix.feature }}
+
+  # macOS
+  #
+  # macOS ships CUPS but no cups.pc, so this job is what exercises the
+  # cups-config discovery fallback. There is no printer here, so only the
+  # library's own unit tests run; the integration tests create print jobs and
+  # must not run unattended.
+  #
+  macos:
+    name: Build (macOS system CUPS)
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        # macos-14 and later are Apple Silicon; macos-13 is Intel.
+        runner:
+          - macos-14
+          - macos-13
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Record what the fallback has to work with. pkg-config is expected to
+      # fail here; cups-config is expected to answer.
+      - name: Show CUPS discovery inputs
+        run: |
+          echo "pkg-config cups:"
+          pkg-config --exists cups && echo "  found" || echo "  not found (expected)"
+          echo "cups-config --version:"
+          cups-config --version
+          echo "cups-config --libs:"
+          cups-config --libs
+          echo "SDK:"
+          xcrun --show-sdk-path
+
+      - name: Build
+        run: cargo build --locked
+
+      # Only the lib tests. The integration suite creates CUPS jobs.
+      - name: Test (library only)
+        run: cargo test --locked --lib
